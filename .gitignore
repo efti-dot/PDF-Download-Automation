@@ -1,1 +1,4 @@
 myenv/
+.env/
+.auth/
+output/
