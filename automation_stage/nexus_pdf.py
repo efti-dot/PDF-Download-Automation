@@ -126,4 +126,4 @@ if __name__ == "__main__":
  
         if not headless:
             input("Press Enter to close the browser...")
-        browser.close() #python app/nexus_pdf.py 62397850
+        browser.close() #python automation_stage/nexus_pdf.py 62397850
