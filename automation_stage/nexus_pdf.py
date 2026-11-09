@@ -1,29 +1,31 @@
 import base64
 import sys
+import time
 from pathlib import Path
 
 from playwright.sync_api import Page
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
 
-from nexus_login import LoginError, get_logged_in_context, _screenshot as screenshot
-from nexus_search import SEARCH, search_po
+from nexus_login import LoginError, get_logged_in_context, screenshot
+from nexus_search import search_po
 from nexus_order import open_order
 
 PDF = {
     "more_button": "button.btn-actions[data-buttonname='$menu.$more']",
     "view_pdf": "a[data-buttonname='viewPDF']",
-    "viewer_download": "#save",
     "timeout_ms": 30_000,
 }
- 
+
 PDF_DIR = Path("output/pdfs")
- 
- 
+
+
 def _read_pdf_from_url(page: Page, popup: Page) -> bytes | None:
-    """Fetch the PDF bytes from the popup's URL using the logged-in session."""
-    url = popup.url
+    """Fallback: if a window stayed open with a PDF address, fetch it."""
     try:
+        url = popup.url
+        if not url or url == "about:blank":
+            return None
         if url.startswith("blob:"):
             b64 = popup.evaluate(
                 """async (u) => {
@@ -39,19 +41,8 @@ def _read_pdf_from_url(page: Page, popup: Page) -> bytes | None:
         return page.context.request.get(url).body()
     except Exception:
         return None
- 
- 
-def _click_viewer_download(popup: Page, path: Path) -> bool:
-    """Fallback: click the Download button of Chrome's PDF viewer and save as <path>."""
-    try:
-        with popup.expect_download(timeout=10_000) as dl:
-            popup.locator(PDF["viewer_download"]).first.click(timeout=5_000)
-        dl.value.save_as(str(path))
-        return True
-    except Exception:
-        return False
- 
- 
+
+
 def download_pdf(page: Page, po_id: str) -> dict:
     """
     Call this while the browser is on the order details page.
@@ -60,61 +51,85 @@ def download_pdf(page: Page, po_id: str) -> dict:
     """
     po_id = po_id.strip()
     timeout = PDF["timeout_ms"]
+    context = page.context
     PDF_DIR.mkdir(parents=True, exist_ok=True)
     path = PDF_DIR / f"{po_id}.pdf"          # file is named with the PO id
- 
+
+    downloads, new_pages = [], []
+
+    def on_download(d):
+        downloads.append(d)
+
+    def on_new_page(pg):
+        new_pages.append(pg)
+        pg.on("download", on_download)       # downloads started in the new window
+
+    page.on("download", on_download)
+    context.on("page", on_new_page)
+
     try:
         # open the three-dot menu
         page.locator(PDF["more_button"]).first.click(timeout=timeout)
- 
-        # click View PDF and catch the new window it opens
+
+        # click View PDF
         view = page.locator(PDF["view_pdf"]).first
         view.wait_for(state="visible", timeout=timeout)
-        with page.expect_popup(timeout=timeout) as popup_info:
-            view.click()
-        popup = popup_info.value
- 
-        # wait until the new window has a real URL (not about:blank)
-        popup.wait_for_url(lambda u: u != "about:blank", timeout=timeout)
+        view.click()
+
+        # wait for the download to start
+        deadline = time.time() + timeout / 1000
+        while not downloads and time.time() < deadline:
+            page.wait_for_timeout(200)
+
+        # normal case: a download was caught
+        if downloads:
+            downloads[0].save_as(str(path))
+            if path.read_bytes()[:4] == b"%PDF":
+                return {"po": po_id, "status": "downloaded", "method": "download",
+                        "path": str(path)}
+            path.unlink(missing_ok=True)
+            return {"po": po_id, "status": "error",
+                    "note": "Downloaded file is not a PDF."}
+
+        # fallback: a window stayed open showing the PDF
+        for pg in new_pages:
+            data = _read_pdf_from_url(page, pg)
+            if data and data.startswith(b"%PDF"):
+                path.write_bytes(data)
+                return {"po": po_id, "status": "downloaded", "method": "window url",
+                        "path": str(path)}
+
+        screenshot(page, f"pdf_{po_id}_no_download")
+        return {"po": po_id, "status": "error",
+                "note": f"No download started. New windows seen: {len(new_pages)}"}
+
     except PWTimeout:
         screenshot(page, f"pdf_{po_id}_timeout")
         return {"po": po_id, "status": "error",
-                "note": "Timed out (menu, View PDF button, or new window not found)."}
- 
-    # direct: read the PDF bytes from the window URL
-    data = _read_pdf_from_url(page, popup)
-    if data and data.startswith(b"%PDF"):
-        path.write_bytes(data)
-        popup.close()
-        return {"po": po_id, "status": "downloaded", "method": "direct",
-                "path": str(path)}
- 
-    # fallback: click the Download button in Chrome's PDF viewer
-    if _click_viewer_download(popup, path):
-        popup.close()
-        return {"po": po_id, "status": "downloaded", "method": "viewer button",
-                "path": str(path)}
- 
-    screenshot(popup, f"pdf_{po_id}_failed")
-    return {"po": po_id, "status": "error", "url": popup.url,
-            "note": "Could not read the PDF from the new window."}
- 
- 
+                "note": "Timed out (three-dot menu or View PDF button not found)."}
+    except Exception as e:
+        screenshot(page, f"pdf_{po_id}_exception")
+        return {"po": po_id, "status": "error", "note": f"{type(e).__name__}: {e}"}
+    finally:
+        page.remove_listener("download", on_download)
+        context.remove_listener("page", on_new_page)
+
+
 if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     po_id = args[0] if args else input("PO id: ")
     headless = "--headless" in sys.argv
- 
+
     with sync_playwright() as p:
         try:
             browser, context, page = get_logged_in_context(p, headless=headless)
         except LoginError as e:
             print(f"[error] {e}")
             sys.exit(1)
- 
+
         result = search_po(page, po_id)
         print(f"[search] {result}")
- 
+
         if result["status"] == "found":
             result = open_order(page, po_id)
             print(f"[order] {result}")
@@ -123,7 +138,8 @@ if __name__ == "__main__":
                 print(f"[pdf] {result}")
         else:
             print("[stop] PO not found, nothing to download.")
- 
+
         if not headless:
             input("Press Enter to close the browser...")
         browser.close() #python automation_stage/nexus_pdf.py 62397850
+ 
