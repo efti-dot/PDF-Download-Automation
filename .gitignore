@@ -2,3 +2,4 @@ myenv/
 .env/
 .auth/
 output/
+__pycache__/
