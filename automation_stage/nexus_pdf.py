@@ -12,8 +12,10 @@ from nexus_search import search_po
 from nexus_order import open_order
 
 PDF = {
-    "more_button": "button.btn-actions[data-buttonname='$menu.$more']",
-    "view_pdf": "a[data-buttonname='viewPDF']",
+    # The three-dot button on the order details page
+    "more_button": "button.btn-actions[data-buttonname='$menu.$more']:visible",
+    # The "View PDF" item in the menu
+    "view_pdf": "a[data-buttonname='viewPDF']:visible",
     "timeout_ms": 30_000,
 }
 
@@ -64,24 +66,30 @@ def download_pdf(page: Page, po_id: str) -> dict:
         new_pages.append(pg)
         pg.on("download", on_download)       # downloads started in the new window
 
+    # Listen BEFORE clicking, because the new window closes very fast
     page.on("download", on_download)
     context.on("page", on_new_page)
 
+    step = "starting"
     try:
-        # open the three-dot menu
+        # 1) open the three-dot menu
+        step = "clicking the three-dot menu"
         page.locator(PDF["more_button"]).first.click(timeout=timeout)
 
-        # click View PDF
+        # 2) click View PDF
+        step = "waiting for the View PDF item"
         view = page.locator(PDF["view_pdf"]).first
         view.wait_for(state="visible", timeout=timeout)
+        step = "clicking View PDF"
         view.click()
 
-        # wait for the download to start
+        # 3) wait for the download to start
+        step = "waiting for the download"
         deadline = time.time() + timeout / 1000
         while not downloads and time.time() < deadline:
-            page.wait_for_timeout(200)
+            page.wait_for_timeout(50)
 
-        # normal case: a download was caught
+        # 4a) normal case: a download was caught
         if downloads:
             downloads[0].save_as(str(path))
             if path.read_bytes()[:4] == b"%PDF":
@@ -91,7 +99,7 @@ def download_pdf(page: Page, po_id: str) -> dict:
             return {"po": po_id, "status": "error",
                     "note": "Downloaded file is not a PDF."}
 
-        # fallback: a window stayed open showing the PDF
+        # 4b) fallback: a window stayed open showing the PDF
         for pg in new_pages:
             data = _read_pdf_from_url(page, pg)
             if data and data.startswith(b"%PDF"):
@@ -106,13 +114,20 @@ def download_pdf(page: Page, po_id: str) -> dict:
     except PWTimeout:
         screenshot(page, f"pdf_{po_id}_timeout")
         return {"po": po_id, "status": "error",
-                "note": "Timed out (three-dot menu or View PDF button not found)."}
+                "note": f"Timed out while {step}."}
     except Exception as e:
         screenshot(page, f"pdf_{po_id}_exception")
         return {"po": po_id, "status": "error", "note": f"{type(e).__name__}: {e}"}
     finally:
         page.remove_listener("download", on_download)
         context.remove_listener("page", on_new_page)
+        # Close the extra window(s) opened by View PDF, so tabs never pile up
+        for pg in new_pages:
+            try:
+                if not pg.is_closed():
+                    pg.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
@@ -141,5 +156,4 @@ if __name__ == "__main__":
 
         if not headless:
             input("Press Enter to close the browser...")
-        browser.close() #python automation_stage/nexus_pdf.py 62397850
- 
+        browser.close()
