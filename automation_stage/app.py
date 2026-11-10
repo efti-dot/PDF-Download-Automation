@@ -1,15 +1,3 @@
-"""
-Streamlit app: download Nexus PO pdfs.
-  - type ONE PO number, and/or
-  - upload an Excel (or CSV) file with many PO numbers
-  - choose the folder to save into
-
-Run from the PROJECT ROOT (the folder that contains .env and app/):
-    streamlit run app/streamlit_app.py
-
-Needs:  pip install streamlit pandas openpyxl
-Runs on YOUR PC. Nexus credentials come from .env, not from this page.
-"""
 import json
 import os
 import subprocess
@@ -28,7 +16,7 @@ KNOWN_PO_HEADERS = {"po", "po number", "po no", "po id", "po #", "po_number",
                     "order", "order number", "purchase order"}
 
 st.set_page_config(page_title="Nexus PO Downloader", page_icon="📄")
-st.title("📄 Nexus PO PDF Downloader")
+st.title("Nexus PO PDF Downloader")
 
 if "folder" not in st.session_state:
     st.session_state.folder = str(Path.home() / "Documents" / "Nexus_POs")
@@ -124,7 +112,7 @@ def run_batch(po_list: list, folder: Path, headless: bool, skip_existing: bool) 
     return {"rows": rows, "final": final, "log": "\n".join(log_lines)}
 
 
-# ----------------------------- UI -----------------------------
+# UI
 po_typed = st.text_input("PO number", placeholder="e.g. 62397850").strip()
 
 uploaded = st.file_uploader("Or upload an Excel file with many PO numbers",
