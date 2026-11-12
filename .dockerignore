@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.auth/
+output/
+myenv/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pdf
+*.zip
+.streamlit/secrets.toml

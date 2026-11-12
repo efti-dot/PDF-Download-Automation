@@ -1,5 +1,12 @@
 myenv/
-.env/
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+.env
 .auth/
 output/
-__pycache__/
+.streamlit/secrets.toml
+*.pdf
+*.zip
