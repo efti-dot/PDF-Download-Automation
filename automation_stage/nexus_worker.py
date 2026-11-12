@@ -6,12 +6,13 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 import nexus_pdf
-from nexus_login import LoginError, get_logged_in_context, is_logged_in, login
+from nexus_login import (CONFIG, LoginError, OrdersPageError,
+                         get_logged_in_context, is_logged_in, login)
 from nexus_order import open_order
 from nexus_pdf import download_pdf
 from nexus_search import search_po
 
-PAUSE_BETWEEN_POS_MS = 300      # small pause, be gentle with Nexus
+PAUSE_BETWEEN_POS_MS = 300      # small pause
 MAX_ATTEMPTS = 2                # 1 try + 1 retry for error
 
 
@@ -19,6 +20,22 @@ def emit(kind: str, payload) -> None:
     print(f"{kind}:" + json.dumps(payload), flush=True)
 
 
+# check login
+def check_login() -> dict:
+    try:
+        with sync_playwright() as p:
+            try:
+                browser, context, page = get_logged_in_context(p, headless=True)
+            except LoginError as e:
+                kind = "orders" if isinstance(e, OrdersPageError) else "login"
+                return {"ok": False, "kind": kind, "error": str(e)}
+            browser.close()
+            return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "kind": "system", "error": f"{type(e).__name__}: {e}"}
+
+
+# download PDFs
 def go_home(page, home_url: str) -> None:
     """Return to the orders page (with the PO filter box). Re-login if the session expired."""
     page.goto(home_url, wait_until="domcontentloaded")
@@ -55,7 +72,7 @@ def run(po_ids: list, out_dir: str, headless: bool, skip_existing: bool) -> dict
         except LoginError as e:
             return {"login_error": str(e), "results": []}
 
-        home_url = page.url          # the orders page we return to for every PO
+        home_url = CONFIG["orders_url"]   # the Orders page return
         aborted = False
 
         try:
@@ -95,11 +112,18 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("po_ids", nargs="*", help="one or more PO numbers")
     ap.add_argument("--po-file", help="text file, one PO number per line")
-    ap.add_argument("--out", required=True, help="folder to save the PDFs in")
+    ap.add_argument("--out", help="folder to save the PDFs in")
     ap.add_argument("--headless", action="store_true")
-    ap.add_argument("--skip-existing", action="store_true",
-                    help="skip POs whose <PO>.pdf already exists in the folder")
+    ap.add_argument("--skip-existing", action="store_true")
+    ap.add_argument("--check-login", action="store_true")
     args = ap.parse_args()
+
+    if args.check_login:
+        emit("RESULT_JSON", check_login())
+        raise SystemExit(0)
+
+    if not args.out:
+        ap.error("--out is required")
 
     pos = [p.strip() for p in args.po_ids if p.strip()]
     if args.po_file:
