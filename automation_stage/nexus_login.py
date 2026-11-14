@@ -11,7 +11,7 @@ load_dotenv()   #for just testing
 
 CONFIG = {
     "login_url": "https://network.infornexus.com/login",
-    "orders_url": "https://network.infornexus.com/en/trade/OrdersView.jsp",
+    "orders_url": "https://network.infornexus.com/en/trade/OrdersView.jsp?legacy=true&grain=Order",
     "username_selector": "input[name='userid']",
     "password_selector": "input[name='uPassword']",
     "submit_selector": "#loginButton",
