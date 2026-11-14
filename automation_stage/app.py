@@ -400,6 +400,3 @@ if batch:
                                type="primary")
         c2.download_button("Report (CSV)", df_res.to_csv(index=False).encode("utf-8"),
                            file_name="nexus_download_report.csv", mime="text/csv")
-
-    with st.expander("Details / log"):
-        st.code(batch["log"] or "(no log)")
