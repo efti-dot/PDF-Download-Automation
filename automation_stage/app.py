@@ -1,3 +1,4 @@
+import io
 import json
 import logging
 import os
@@ -15,7 +16,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-st.set_page_config(page_title="Nexus PO Downloader", page_icon="📄")
+st.set_page_config(page_title="Nexus PO Tools", page_icon="📄")
 
 APP_DIR = Path(__file__).resolve().parent
 ROOT = APP_DIR.parent
@@ -28,6 +29,13 @@ IDLE_LOGOUT_MINUTES = int(os.getenv("IDLE_LOGOUT_MINUTES", "15"))
 MAX_FAILED_LOGINS = 3
 FAIL_WINDOW_SECONDS = 15 * 60
 COOKIE_NAME = "nexus_sid"
+
+PAGE_PDF = "PO PDF download"
+PAGE_SUMMARY = "PO summary (Excel)"
+
+# PO summary Excel columns (the "Totals" row of the PO Summary table)
+SUMMARY_COLUMNS = ["PO", "Item Qty", "Pkg Count", "Net Net", "Net", "Gross",
+                   "Weight Unit", "Vol", "Vol Unit"]
 
 KNOWN_PO_HEADERS = {"po", "po number", "po no", "po id", "po #", "po_number",
                     "order", "order number", "purchase order"}
@@ -156,7 +164,7 @@ def verify_login(user: str, pw: str):
 
 
 def sign_in_screen() -> None:
-    st.title("Nexus PO PDF Downloader")
+    st.title("Nexus PO Tools")
     st.caption("Sign in with your own Infor Nexus ID and password.")
     with st.form("signin"):
         user = st.text_input("Nexus ID")
@@ -218,17 +226,80 @@ def rows_to_df(rows: list) -> pd.DataFrame:
     ])
 
 
-def run_batch(po_list: list, user: str, pw: str, token: str) -> dict:
-    """Run the worker in a private temp folder, show live progress, return rows + ZIP."""
+def summary_excel(rows: list) -> bytes | None:
+    """One row per PO with its 'Totals' values. POs that failed go on a 2nd sheet."""
+    done = [{"PO": r["po"], **r["totals"]} for r in rows
+            if r.get("status") == "done" and r.get("totals")]
+    failed = [r for r in rows if r.get("status") != "done"]
+    if not done:
+        return None
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        pd.DataFrame(done, columns=SUMMARY_COLUMNS).to_excel(
+            xw, sheet_name="PO Summary", index=False)
+        if failed:
+            rows_to_df(failed).to_excel(xw, sheet_name="Not done", index=False)
+        for ws in xw.book.worksheets:            # readable column widths
+            for col in ws.columns:
+                width = max(len(str(c.value or "")) for c in col)
+                ws.column_dimensions[col[0].column_letter].width = min(max(width + 2, 10), 60)
+    return buf.getvalue()
+
+
+def po_inputs(key: str) -> list:
+    """PO number box + optional Excel/CSV upload. Returns the clean PO list."""
+    po_typed = st.text_input("PO number", placeholder="", key=f"{key}_po").strip()
+    uploaded = st.file_uploader("Upload an Excel file", type=["xlsx", "csv"],
+                                key=f"{key}_file")
+
+    excel_pos, invalid = [], []
+    if uploaded is not None:
+        try:
+            df = load_table(uploaded)
+            cols = list(df.columns)
+            default = next((i for i, c in enumerate(cols)
+                            if str(c).strip().lower() in KNOWN_PO_HEADERS), 0)
+            col = st.selectbox("Which column has the PO numbers?", cols, index=default,
+                               key=f"{key}_col")
+            for v in df[col].tolist():
+                s = clean_po(v)
+                if not s:
+                    continue
+                (excel_pos if s.isdigit() else invalid).append(s)
+        except Exception as e:
+            st.error(f"Could not read the file: {e}")
+
+    if po_typed:
+        if po_typed.isdigit():
+            excel_pos.insert(0, po_typed)
+        else:
+            invalid.append(po_typed)
+
+    po_list = list(dict.fromkeys(excel_pos))          # remove duplicates, keep order
+
+    if po_list:
+        st.info(f"{len(po_list)} PO number(s) ready (maximum {MAX_POS_PER_RUN} per run).")
+    if invalid:
+        st.warning(f"Ignored {len(invalid)} value(s) that are not digits only: "
+                   f"{', '.join(invalid[:5])}{' ...' if len(invalid) > 5 else ''}")
+    return po_list
+
+
+def run_batch(po_list: list, user: str, pw: str, token: str, mode: str = "pdf") -> dict:
+    """Run the worker in a private temp folder, show live progress, return rows (+ ZIP).
+    mode: "pdf" = PO PDF download, "summary" = PO summary page."""
     work = Path(tempfile.mkdtemp(prefix="nexus_run_"))
-    pdf_dir, shots = work / "pdfs", work / "shots"
+    out_dir, shots = work / "out", work / "shots"
     po_file = work / "pos.txt"
     po_file.write_text("\n".join(po_list), encoding="utf-8")
 
     env = {**os.environ, "NEXUS_USERNAME": user, "NEXUS_PASSWORD": pw,
            "NEXUS_SCREENSHOT_DIR": str(shots)}
     cmd = [sys.executable, "-u", str(WORKER), "--po-file", str(po_file),
-           "--out", str(pdf_dir), "--headless"]
+           "--out", str(out_dir), "--headless"]
+    if mode == "summary":
+        cmd.append("--summary")
 
     bar = st.progress(0.0, text="Starting browser and logging in...")
     table_box = st.empty()
@@ -262,8 +333,8 @@ def run_batch(po_list: list, user: str, pw: str, token: str) -> dict:
         proc.wait()
         get_session(token)
 
-        if pdf_dir.exists() and any(pdf_dir.glob("*.pdf")):
-            archive = shutil.make_archive(str(work / "nexus_pdfs"), "zip", pdf_dir)
+        if mode == "pdf" and out_dir.exists() and any(out_dir.glob("*.pdf")):
+            archive = shutil.make_archive(str(work / "nexus_pdfs"), "zip", out_dir)
             zip_bytes = Path(archive).read_bytes()
     finally:
         watchdog.cancel()
@@ -277,11 +348,105 @@ def run_batch(po_list: list, user: str, pw: str, token: str) -> dict:
     counts = {}
     for r in rows:
         counts[r.get("status")] = counts.get(r.get("status"), 0) + 1
-    log.info("run user=%s pos=%d result=%s timed_out=%s",
-             user, len(po_list), counts, timed_out.is_set())
+    log.info("run mode=%s user=%s pos=%d result=%s timed_out=%s",
+             mode, user, len(po_list), counts, timed_out.is_set())
 
     return {"rows": rows, "final": final, "zip": zip_bytes, "timed_out": timed_out.is_set(),
             "log": "\n".join(log_lines)}
+
+
+def start_button(po_list: list, label: str, state_key: str, mode: str) -> None:
+    """Checks the list, takes a browser slot, runs the worker, stores the result."""
+    if not st.button(label, type="primary", key=f"{state_key}_start"):
+        return
+    if not po_list:
+        st.error("Enter a PO number or upload an Excel file first.")
+    elif len(po_list) > MAX_POS_PER_RUN:
+        st.error(f"Too many POs: {len(po_list)}. Please split the list into runs of "
+                 f"{MAX_POS_PER_RUN} or fewer.")
+    else:
+        with run_slot() as ok:
+            if not ok:
+                st.warning("The server is busy with other runs. "
+                           "Please try again in a few minutes.")
+            else:
+                st.session_state[state_key] = run_batch(
+                    po_list, user, pw, st.session_state["token"], mode)
+
+
+def batch_problem(batch: dict) -> bool:
+    """Shows the timeout / start / login messages. True if there are no results to show."""
+    if batch["timed_out"]:
+        st.warning(f"The run was stopped after {MAX_RUN_MINUTES} minutes. "
+                   "Results finished so far are shown below. Run the rest again.")
+    if batch["final"] is None and not batch["rows"]:
+        st.error("The run stopped before it started. Please try again.")
+        return True
+    if batch["final"] and batch["final"].get("login_error"):
+        st.error("Login to Nexus failed. Please log out and sign in again.")
+        return True
+    return False
+
+
+# page: PO PDF download
+def pdf_page() -> None:
+    st.title("Nexus PO PDF Downloader")
+    po_list = po_inputs("pdf")
+    start_button(po_list, "Start download", "batch", "pdf")
+
+    batch = st.session_state.get("batch")
+    if not batch or batch_problem(batch):
+        return
+
+    df_res = rows_to_df(batch["rows"])
+    counts = df_res["Status"].value_counts().to_dict() if len(df_res) else {}
+    st.success(
+        f"Finished. Downloaded: {counts.get('downloaded', 0)} | "
+        f"Not found: {counts.get('not_found', 0)} | "
+        f"Errors: {counts.get('error', 0) + counts.get('login_failed', 0)}"
+    )
+    st.dataframe(df_res)
+
+    c1, c2 = st.columns(2)
+    if batch["zip"]:
+        c1.download_button("Download all PDFs (ZIP)", batch["zip"],
+                           file_name="nexus_pdfs.zip", mime="application/zip",
+                           type="primary")
+    c2.download_button("Report (CSV)", df_res.to_csv(index=False).encode("utf-8"),
+                       file_name="nexus_download_report.csv", mime="text/csv")
+
+
+# page: PO summary -> Excel with the "Totals" row of each PO
+def summary_page() -> None:
+    st.title("Nexus PO Summary")
+    st.caption("Searches each PO on the Packing Plan Manifests page, opens its PO summary "
+               "and collects the Totals row into an Excel file.")
+    po_list = po_inputs("summary")
+    start_button(po_list, "Start PO summary", "summary_batch", "summary")
+
+    batch = st.session_state.get("summary_batch")
+    if not batch or batch_problem(batch):
+        return
+
+    df_res = rows_to_df(batch["rows"])
+    counts = df_res["Status"].value_counts().to_dict() if len(df_res) else {}
+    st.success(
+        f"Finished. Done: {counts.get('done', 0)} | "
+        f"Not found: {counts.get('not_found', 0)} | "
+        f"Errors: {counts.get('error', 0) + counts.get('login_failed', 0)}"
+    )
+    st.dataframe(df_res)
+
+    c1, c2 = st.columns(2)
+    if "excel" not in batch:                     # build once, keep for reruns
+        batch["excel"] = summary_excel(batch["rows"])
+    if batch["excel"]:
+        c1.download_button(
+            "Download PO summary (Excel)", batch["excel"],
+            file_name="nexus_po_summary.xlsx", type="primary",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    c2.download_button("Report (CSV)", df_res.to_csv(index=False).encode("utf-8"),
+                       file_name="nexus_summary_report.csv", mime="text/csv")
 
 
 # session restore
@@ -314,6 +479,8 @@ pw = st.session_state["pw"]
 
 with st.sidebar:
     st.write(f"Signed in as **{user}**")
+    page_choice = st.radio("Choose a tool", [PAGE_PDF, PAGE_SUMMARY], key="page")
+    st.divider()
     if st.button("Log out"):
         drop_session(st.session_state.get("token"))
         st.session_state.clear()          # removes all
@@ -321,82 +488,7 @@ with st.sidebar:
         st.rerun()
 
 # main page
-st.title("Nexus PO PDF Downloader")
-
-po_typed = st.text_input("PO number", placeholder="").strip()
-uploaded = st.file_uploader("Upload an Excel file",
-                            type=["xlsx", "csv"])
-
-excel_pos, invalid = [], []
-if uploaded is not None:
-    try:
-        df = load_table(uploaded)
-        cols = list(df.columns)
-        default = next((i for i, c in enumerate(cols)
-                        if str(c).strip().lower() in KNOWN_PO_HEADERS), 0)
-        col = st.selectbox("Which column has the PO numbers?", cols, index=default)
-        for v in df[col].tolist():
-            s = clean_po(v)
-            if not s:
-                continue
-            (excel_pos if s.isdigit() else invalid).append(s)
-    except Exception as e:
-        st.error(f"Could not read the file: {e}")
-
-if po_typed:
-    if po_typed.isdigit():
-        excel_pos.insert(0, po_typed)
-    else:
-        invalid.append(po_typed)
-
-po_list = list(dict.fromkeys(excel_pos))          # remove duplicates, keep order
-
-if po_list:
-    st.info(f"{len(po_list)} PO number(s) ready (maximum {MAX_POS_PER_RUN} per run).")
-if invalid:
-    st.warning(f"Ignored {len(invalid)} value(s) that are not digits only: "
-               f"{', '.join(invalid[:5])}{' ...' if len(invalid) > 5 else ''}")
-
-if st.button("Start download", type="primary"):
-    if not po_list:
-        st.error("Enter a PO number or upload an Excel file first.")
-    elif len(po_list) > MAX_POS_PER_RUN:
-        st.error(f"Too many POs: {len(po_list)}. Please split the list into runs of "
-                 f"{MAX_POS_PER_RUN} or fewer.")
-    else:
-        with run_slot() as ok:
-            if not ok:
-                st.warning("The server is busy with other downloads. "
-                           "Please try again in a few minutes.")
-            else:
-                st.session_state["batch"] = run_batch(po_list, user, pw, st.session_state["token"])
-
-batch = st.session_state.get("batch")
-if batch:
-    final, rows = batch["final"], batch["rows"]
-
-    if batch["timed_out"]:
-        st.warning(f"The run was stopped after {MAX_RUN_MINUTES} minutes. "
-                   "The PDFs finished so far are in the ZIP. Run the rest again.")
-
-    if final is None and not rows:
-        st.error("The download stopped before it started. Please try again.")
-    elif final and final.get("login_error"):
-        st.error("Login to Nexus failed. Please log out and sign in again.")
-    else:
-        df_res = rows_to_df(rows)
-        counts = df_res["Status"].value_counts().to_dict() if len(df_res) else {}
-        st.success(
-            f"Finished. Downloaded: {counts.get('downloaded', 0)} | "
-            f"Not found: {counts.get('not_found', 0)} | "
-            f"Errors: {counts.get('error', 0) + counts.get('login_failed', 0)}"
-        )
-        st.dataframe(df_res)
-
-        c1, c2 = st.columns(2)
-        if batch["zip"]:
-            c1.download_button("Download all PDFs (ZIP)", batch["zip"],
-                               file_name="nexus_pdfs.zip", mime="application/zip",
-                               type="primary")
-        c2.download_button("Report (CSV)", df_res.to_csv(index=False).encode("utf-8"),
-                           file_name="nexus_download_report.csv", mime="text/csv")
+if page_choice == PAGE_SUMMARY:
+    summary_page()
+else:
+    pdf_page()
