@@ -11,6 +11,8 @@ from nexus_login import (CONFIG, LoginError, OrdersPageError,
 from nexus_order import open_order
 from nexus_pdf import download_pdf
 from nexus_search import search_po
+from nexus_summary import (ManifestsPageError, open_manifests_page, open_po_summary,
+                           read_summary_totals)
 
 PAUSE_BETWEEN_POS_MS = 300      # small pause
 MAX_ATTEMPTS = 2                # 1 try + 1 retry for error
@@ -43,8 +45,8 @@ def go_home(page, home_url: str) -> None:
         login(page, os.getenv("NEXUS_USERNAME", ""), os.getenv("NEXUS_PASSWORD", ""))
 
 
-def process_one(page, po_id: str, home_url: str) -> dict:
-    go_home(page, home_url)
+def process_pdf(page, po_id: str, out: Path) -> dict:
+    go_home(page, CONFIG["orders_url"])
 
     found = search_po(page, po_id)
     if found["status"] != "found":
@@ -59,10 +61,21 @@ def process_one(page, po_id: str, home_url: str) -> dict:
     return download_pdf(page, po_id)
 
 
-def run(po_ids: list, out_dir: str, headless: bool, skip_existing: bool) -> dict:
+# PO summary: open the summary page and read the "Totals" row
+def process_summary(page, po_id: str, out: Path) -> dict:
+    open_manifests_page(page)
+    opened = open_po_summary(page, po_id)
+    if opened["status"] != "opened":
+        return opened
+    return read_summary_totals(page, po_id, opened)
+
+
+def run(po_ids: list, out_dir: str, headless: bool, skip_existing: bool,
+        mode: str = "pdf") -> dict:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    nexus_pdf.PDF_DIR = out          # tell nexus_pdf where to save
+    nexus_pdf.PDF_DIR = out          # tell where to save
+    process = process_summary if mode == "summary" else process_pdf
 
     results, total = [], len(po_ids)
 
@@ -72,23 +85,26 @@ def run(po_ids: list, out_dir: str, headless: bool, skip_existing: bool) -> dict
         except LoginError as e:
             return {"login_error": str(e), "results": []}
 
-        home_url = CONFIG["orders_url"]   # the Orders page return
         aborted = False
 
         try:
             for i, po in enumerate(po_ids, 1):
                 target = out / f"{po}.pdf"
 
-                if skip_existing and target.exists():
+                if mode == "pdf" and skip_existing and target.exists():
                     res = {"po": po, "status": "skipped",
                            "note": "File already exists.", "path": str(target)}
                 else:
                     res = None
                     for attempt in range(MAX_ATTEMPTS):
                         try:
-                            res = process_one(page, po, home_url)
+                            res = process(page, po, out)
                         except LoginError as e:
                             res = {"po": po, "status": "login_failed", "note": str(e)}
+                            aborted = True
+                            break
+                        except ManifestsPageError as e:      # no access: same for every PO
+                            res = {"po": po, "status": "error", "note": str(e)}
                             aborted = True
                             break
                         except Exception as e:
@@ -112,10 +128,12 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("po_ids", nargs="*", help="one or more PO numbers")
     ap.add_argument("--po-file", help="text file, one PO number per line")
-    ap.add_argument("--out", help="folder to save the PDFs in")
+    ap.add_argument("--out", help="folder to save the output in")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--skip-existing", action="store_true")
     ap.add_argument("--check-login", action="store_true")
+    ap.add_argument("--summary", action="store_true",
+                    help="PO summary mode (Packing Plan Manifests page) instead of PDFs")
     args = ap.parse_args()
 
     if args.check_login:
@@ -130,4 +148,5 @@ if __name__ == "__main__":
         pos += [l.strip() for l in Path(args.po_file).read_text(encoding="utf-8").splitlines() if l.strip()]
     pos = list(dict.fromkeys(pos))     # remove duplicates, keep order
 
-    emit("RESULT_JSON", run(pos, args.out, args.headless, args.skip_existing))
+    mode = "summary" if args.summary else "pdf"
+    emit("RESULT_JSON", run(pos, args.out, args.headless, args.skip_existing, mode))
