@@ -30,8 +30,8 @@ MAX_FAILED_LOGINS = 3
 FAIL_WINDOW_SECONDS = 15 * 60
 COOKIE_NAME = "nexus_sid"
 
-PAGE_PDF = "PO PDF download"
-PAGE_SUMMARY = "PO summary (Excel)"
+PAGE_PDF = "DPO PDF download"
+PAGE_SUMMARY = "Packing Plans"
 
 # PO summary Excel columns (the "Totals" row of the PO Summary table)
 SUMMARY_COLUMNS = ["PO", "Item Qty", "Pkg Count", "Net Net", "Net", "Gross",
@@ -164,7 +164,7 @@ def verify_login(user: str, pw: str):
 
 
 def sign_in_screen() -> None:
-    st.title("Nexus PO Tools")
+    st.title("Nexus Automation Tools")
     st.caption("Sign in with your own Infor Nexus ID and password.")
     with st.form("signin"):
         user = st.text_input("Nexus ID")
@@ -388,9 +388,9 @@ def batch_problem(batch: dict) -> bool:
     return False
 
 
-# page: PO PDF download
+# PO PDF download page
 def pdf_page() -> None:
-    st.title("Nexus PO PDF Downloader")
+    st.title("DPO PDF Downloader")
     po_list = po_inputs("pdf")
     start_button(po_list, "Start download", "batch", "pdf")
 
@@ -416,13 +416,11 @@ def pdf_page() -> None:
                        file_name="nexus_download_report.csv", mime="text/csv")
 
 
-# page: PO summary -> Excel with the "Totals" row of each PO
+# PO summary page
 def summary_page() -> None:
-    st.title("Nexus PO Summary")
-    st.caption("Searches each PO on the Packing Plan Manifests page, opens its PO summary "
-               "and collects the Totals row into an Excel file.")
+    st.title("Packing Plans")
     po_list = po_inputs("summary")
-    start_button(po_list, "Start PO summary", "summary_batch", "summary")
+    start_button(po_list, "Download PO summary", "summary_batch", "summary")
 
     batch = st.session_state.get("summary_batch")
     if not batch or batch_problem(batch):
