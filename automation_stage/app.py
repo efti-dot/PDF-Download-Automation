@@ -2,6 +2,7 @@ import io
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ WORKER = APP_DIR / "nexus_worker.py"
 
 MAX_CONCURRENT_RUNS = int(os.getenv("MAX_CONCURRENT_RUNS", "3"))
 MAX_POS_PER_RUN = int(os.getenv("MAX_POS_PER_RUN", "200"))
+MAX_TYPED_POS = 10
 MAX_RUN_MINUTES = int(os.getenv("MAX_RUN_MINUTES", "240"))
 IDLE_LOGOUT_MINUTES = int(os.getenv("IDLE_LOGOUT_MINUTES", "15"))
 MAX_FAILED_LOGINS = 3
@@ -247,9 +249,19 @@ def summary_excel(rows: list) -> bytes | None:
     return buf.getvalue()
 
 
+def split_typed_pos(text: str) -> list:
+    """'62240228, 62075654 62152463;62168894' -> ['62240228', '62075654', ...]"""
+    return [s for s in re.split(r"[\s,;|]+", text) if s]
+
+
 def po_inputs(key: str) -> list:
-    """PO number box + optional Excel/CSV upload. Returns the clean PO list."""
-    po_typed = st.text_input("PO number", placeholder="", key=f"{key}_po").strip()
+    """PO number box (1 to MAX_TYPED_POS numbers) + optional Excel/CSV upload.
+    Returns the clean PO list."""
+    po_typed = st.text_input(
+        f"PO number(s), up to {MAX_TYPED_POS}",
+        placeholder="62240228, 62075654, 62152463", key=f"{key}_po",
+        help="Separate PO numbers with commas or spaces. For more, upload an Excel file.",
+    ).strip()
     uploaded = st.file_uploader("Upload an Excel file", type=["xlsx", "csv"],
                                 key=f"{key}_file")
 
@@ -270,11 +282,14 @@ def po_inputs(key: str) -> list:
         except Exception as e:
             st.error(f"Could not read the file: {e}")
 
-    if po_typed:
-        if po_typed.isdigit():
-            excel_pos.insert(0, po_typed)
-        else:
-            invalid.append(po_typed)
+    typed = split_typed_pos(po_typed)
+    if len(typed) > MAX_TYPED_POS:
+        st.warning(f"You typed {len(typed)} PO numbers. Only the first {MAX_TYPED_POS} "
+                   "are used. For more, upload an Excel file.")
+        typed = typed[:MAX_TYPED_POS]
+    typed_ok = [s for s in typed if s.isdigit()]
+    invalid += [s for s in typed if not s.isdigit()]
+    excel_pos = typed_ok + excel_pos                  # typed POs first
 
     po_list = list(dict.fromkeys(excel_pos))          # remove duplicates, keep order
 
