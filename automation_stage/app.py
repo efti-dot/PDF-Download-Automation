@@ -17,13 +17,13 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-st.set_page_config(page_title="Nexus PO Tools", page_icon="📄")
+st.set_page_config(page_title="Nexus Automation Tools", page_icon="📄")
 
 APP_DIR = Path(__file__).resolve().parent
 ROOT = APP_DIR.parent
 WORKER = APP_DIR / "nexus_worker.py"
 
-MAX_CONCURRENT_RUNS = int(os.getenv("MAX_CONCURRENT_RUNS", "3"))
+MAX_CONCURRENT_RUNS = int(os.getenv("MAX_CONCURRENT_RUNS", "5"))
 MAX_POS_PER_RUN = int(os.getenv("MAX_POS_PER_RUN", "200"))
 MAX_TYPED_POS = 10
 MAX_RUN_MINUTES = int(os.getenv("MAX_RUN_MINUTES", "240"))
