@@ -35,7 +35,7 @@ COOKIE_NAME = "nexus_sid"
 PAGE_PDF = "DPO PDF download"
 PAGE_SUMMARY = "Packing Plans"
 
-# PO summary Excel columns (the "Totals" row of the PO Summary table)
+# PO summary Excel columns
 SUMMARY_COLUMNS = ["PO", "Item Qty", "Pkg Count", "Net Net", "Net", "Gross",
                    "Weight Unit", "Vol", "Vol Unit"]
 
