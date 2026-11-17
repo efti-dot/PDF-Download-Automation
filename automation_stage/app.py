@@ -258,8 +258,8 @@ def po_inputs(key: str) -> list:
     """PO number box (1 to MAX_TYPED_POS numbers) + optional Excel/CSV upload.
     Returns the clean PO list."""
     po_typed = st.text_input(
-        f"PO number(s), up to {MAX_TYPED_POS}",
-        placeholder="62240228, 62075654, 62152463", key=f"{key}_po",
+        f"PO number(s)",
+        placeholder="", key=f"{key}_po",
         help="Separate PO numbers with commas or spaces. For more, upload an Excel file.",
     ).strip()
     uploaded = st.file_uploader("Upload an Excel file", type=["xlsx", "csv"],
