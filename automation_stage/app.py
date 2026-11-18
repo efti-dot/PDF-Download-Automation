@@ -46,15 +46,46 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", stream
 log = logging.getLogger("nexus_app")
 
 
+TEMP_PREFIXES = ("nexus_run_", "nexus_chk_")     # private temp folders for cookies
+SWEEP_SECONDS = 60
+
+
+def remove_leftover_temp() -> None:
+    """At start-up: delete temp folders left by a crash (could contain saved cookies).
+    Assumes one app instance per server (it removes all such folders)."""
+    tmp = Path(tempfile.gettempdir())
+    removed = 0
+    for prefix in TEMP_PREFIXES:
+        for d in tmp.glob(prefix + "*"):
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+    if removed:
+        log.info("removed %d leftover temp folder(s)", removed)
+
+
+def _sweeper(s: dict) -> None:
+    """Every minute: remove idle sessions (and their cookies), even if nobody uses the app."""
+    while True:
+        time.sleep(SWEEP_SECONDS)
+        with s["lock"]:
+            n = _purge_idle(s, time.time())
+        if n:
+            log.info("idle logout: removed %d session(s)", n)
+
+
 # shared state for all users
 @st.cache_resource
 def shared():
-    return {
+    s = {
         "sem": threading.BoundedSemaphore(MAX_CONCURRENT_RUNS),
         "fails": {},
-        "sessions": {},          # token
+        "sessions": {},
+        "runs": {}, 
         "lock": threading.Lock(),
     }
+    remove_leftover_temp()
+    threading.Thread(target=_sweeper, args=(s,), daemon=True, name="session-sweeper").start()
+    return s
 
 
 @contextmanager
@@ -91,12 +122,41 @@ def clear_failures(user: str) -> None:
 
 # login sessions save
 
-def create_session(user: str, pw: str) -> str:
+def create_session(user: str, nexus_state: str) -> str:
+    """nexus_state = saved Nexus cookies (JSON text), kept in memory only."""
     token = secrets.token_urlsafe(32)
     s = shared()
     with s["lock"]:
-        s["sessions"][token] = {"user": user, "pw": pw, "last": time.time()}
+        s["sessions"][token] = {"user": user, "last": time.time(),
+                                "nexus_state": nexus_state}
     return token
+
+
+def set_nexus_state(token, nexus_state: str | None) -> None:
+    """Update the saved Nexus cookies after a run (None = session ended, sign in again)."""
+    s = shared()
+    with s["lock"]:
+        if token in s["sessions"]:
+            s["sessions"][token]["nexus_state"] = nexus_state
+
+
+def _drop(s: dict, token) -> None:
+    """Remove a session and its saved Nexus cookies. Caller holds s["lock"].
+    Also stops this user's running worker: it has its own copy of the cookies in its
+    temp folder, which run_batch deletes when the worker ends."""
+    s["sessions"].pop(token, None)
+    for proc in s["runs"].pop(token, []):
+        if proc.poll() is None:
+            proc.kill()
+
+
+def _purge_idle(s: dict, now: float) -> int:
+    """Remove sessions idle longer than IDLE_LOGOUT_MINUTES. Caller holds s["lock"]."""
+    idle = [t for t, v in s["sessions"].items()
+            if now - v["last"] > IDLE_LOGOUT_MINUTES * 60]
+    for t in idle:
+        _drop(s, t)
+    return len(idle)
 
 
 def get_session(token):
@@ -105,9 +165,7 @@ def get_session(token):
         return None
     s, now = shared(), time.time()
     with s["lock"]:
-        for t in [t for t, v in s["sessions"].items()
-                  if now - v["last"] > IDLE_LOGOUT_MINUTES * 60]:
-            del s["sessions"][t]
+        _purge_idle(s, now)
         sess = s["sessions"].get(token)
         if sess:
             sess["last"] = now
@@ -116,9 +174,26 @@ def get_session(token):
 
 
 def drop_session(token) -> None:
+    """Log out: the session and its saved Nexus cookies are removed from the server."""
     s = shared()
     with s["lock"]:
-        s["sessions"].pop(token, None)
+        _drop(s, token)
+
+
+def register_run(token, proc) -> None:
+    s = shared()
+    with s["lock"]:
+        s["runs"].setdefault(token, []).append(proc)
+
+
+def unregister_run(token, proc) -> None:
+    s = shared()
+    with s["lock"]:
+        procs = s["runs"].get(token, [])
+        if proc in procs:
+            procs.remove(proc)
+        if not procs:
+            s["runs"].pop(token, None)
 
 
 def set_cookie(name: str, value: str, delete: bool = False) -> None:
@@ -134,11 +209,22 @@ def set_cookie(name: str, value: str, delete: bool = False) -> None:
 
 
 # login check
+def read_state_file(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8") if path.exists() else None
+    except OSError:
+        return None
+
+
 def verify_login(user: str, pw: str):
-    """Returns (ok, kind, message). Runs the worker in --check-login mode."""
-    with tempfile.TemporaryDirectory(prefix="nexus_chk_") as shots:
+    """Returns (ok, kind, message, nexus_state). Runs the worker in --check-login mode.
+    This is the ONLY place the password is used. nexus_state = the Nexus cookies
+    from this login; all runs use them instead of the password."""
+    with tempfile.TemporaryDirectory(prefix="nexus_chk_") as tmp:
+        state_file = Path(tmp) / "state.json"
         env = {**os.environ, "NEXUS_USERNAME": user, "NEXUS_PASSWORD": pw,
-               "NEXUS_SCREENSHOT_DIR": shots}
+               "NEXUS_SCREENSHOT_DIR": str(Path(tmp) / "shots"),
+               "NEXUS_STATE_FILE": str(state_file)}
         try:
             proc = subprocess.run(
                 [sys.executable, str(WORKER), "--check-login"],
@@ -146,29 +232,33 @@ def verify_login(user: str, pw: str):
                 encoding="utf-8", errors="replace", timeout=120,
             )
         except subprocess.TimeoutExpired:
-            return False, "system", "Nexus did not answer in time. Please try again."
+            return False, "system", "Nexus did not answer in time. Please try again.", None
+        nexus_state = read_state_file(state_file)      # read before the folder is deleted
 
     for line in reversed((proc.stdout or "").splitlines()):
         if line.startswith("RESULT_JSON:"):
             d = json.loads(line[len("RESULT_JSON:"):])
             if d.get("ok"):
-                return True, "", ""
+                if not nexus_state:
+                    log.error("check-login ok, but the Nexus session was not saved")
+                    return False, "system", "Could not keep the Nexus session (server problem).", None
+                return True, "", "", nexus_state
             if d.get("kind") == "login":
-                return False, "login", "Login failed. Check your Nexus ID and password."
+                return False, "login", "Login failed. Check your Nexus ID and password.", None
             if d.get("kind") == "orders":
                 log.info("orders page not available: %s", d.get("error"))
                 return False, "orders", ("Your login works, but the Orders page could not be "
-                                         "opened for this account.")
+                                         "opened for this account."), None
             log.error("check-login system error: %s", d.get("error"))
-            return False, "system", "Could not check the login (server problem)."
+            return False, "system", "Could not check the login (server problem).", None
     log.error("check-login worker gave no result")
-    return False, "system", "Could not check the login (server problem)."
+    return False, "system", "Could not check the login (server problem).", None
 
 
 def sign_in_screen() -> None:
     st.title("Nexus Automation Tools")
     st.caption("Sign in with your own Infor Nexus ID and password.")
-    with st.form("signin"):
+    with st.form("signin", clear_on_submit=True):     # password box is emptied after submit
         user = st.text_input("Nexus ID")
         pw = st.text_input("Password", type="password")
         go = st.form_submit_button("Login", type="primary")
@@ -189,12 +279,12 @@ def sign_in_screen() -> None:
             st.warning("The server is busy right now. Please try again in a few minutes.")
             return
         with st.spinner("Checking your Nexus login..."):
-            valid, kind, msg = verify_login(user, pw)
+            valid, kind, msg, nexus_state = verify_login(user, pw)
 
     if valid:
         clear_failures(user)
-        token = create_session(user, pw)
-        st.session_state.update(user=user, pw=pw, token=token, set_cookie=token)
+        token = create_session(user, nexus_state)
+        st.session_state.update(user=user, token=token, set_cookie=token)
         log.info("login ok user=%s", user)
         st.rerun()
     else:
@@ -258,7 +348,7 @@ def po_inputs(key: str) -> list:
     """PO number box (1 to MAX_TYPED_POS numbers) + optional Excel/CSV upload.
     Returns the clean PO list."""
     po_typed = st.text_input(
-        f"PO number(s)",
+        f"PO number(s), up to {MAX_TYPED_POS}",
         placeholder="", key=f"{key}_po",
         help="Separate PO numbers with commas or spaces. For more, upload an Excel file.",
     ).strip()
@@ -301,16 +391,31 @@ def po_inputs(key: str) -> list:
     return po_list
 
 
-def run_batch(po_list: list, user: str, pw: str, token: str, mode: str = "pdf") -> dict:
+def nexus_session_alive(token) -> bool:
+    return bool((get_session(token) or {}).get("nexus_state"))
+
+
+SESSION_ENDED_MSG = ("Your Nexus session has ended. Download any results below, "
+                     "then log out and sign in again.")
+
+
+def run_batch(po_list: list, user: str, token: str, mode: str = "pdf") -> dict:
     """Run the worker in a private temp folder, show live progress, return rows (+ ZIP).
-    mode: "pdf" = PO PDF download, "summary" = PO summary page."""
+    mode: "pdf" = PO PDF download, "summary" = PO summary page.
+    The worker gets the saved Nexus cookies only, never a password."""
     work = Path(tempfile.mkdtemp(prefix="nexus_run_"))
     out_dir, shots = work / "out", work / "shots"
     po_file = work / "pos.txt"
     po_file.write_text("\n".join(po_list), encoding="utf-8")
 
-    env = {**os.environ, "NEXUS_USERNAME": user, "NEXUS_PASSWORD": pw,
-           "NEXUS_SCREENSHOT_DIR": str(shots)}
+    # saved Nexus session
+    state_file = work / "state.json"
+    nexus_state = (get_session(token) or {}).get("nexus_state")
+    if nexus_state:
+        state_file.write_text(nexus_state, encoding="utf-8")
+
+    env = {**os.environ, "NEXUS_USERNAME": user, "NEXUS_PASSWORD": "",
+           "NEXUS_SCREENSHOT_DIR": str(shots), "NEXUS_STATE_FILE": str(state_file)}
     cmd = [sys.executable, "-u", str(WORKER), "--po-file", str(po_file),
            "--out", str(out_dir), "--headless"]
     if mode == "summary":
@@ -321,10 +426,15 @@ def run_batch(po_list: list, user: str, pw: str, token: str, mode: str = "pdf") 
     rows, log_lines, final, zip_bytes = [], [], None, None
     timed_out = threading.Event()
 
-    proc = subprocess.Popen(
-        cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace", bufsize=1,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+        )
+    except Exception:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+    register_run(token, proc)
 
     def _kill():
         timed_out.set()
@@ -339,7 +449,7 @@ def run_batch(po_list: list, user: str, pw: str, token: str, mode: str = "pdf") 
             if line.startswith("PROGRESS:"):
                 d = json.loads(line[len("PROGRESS:"):])
                 rows.append(d["result"])
-                get_session(token)        # long runs count as activity (no idle logout)
+                get_session(token)        # long runs count as activity
                 bar.progress(d["index"] / d["total"],
                              text=f"{d['index']} of {d['total']} done")
                 table_box.dataframe(rows_to_df(rows))
@@ -347,6 +457,7 @@ def run_batch(po_list: list, user: str, pw: str, token: str, mode: str = "pdf") 
                 final = json.loads(line[len("RESULT_JSON:"):])
         proc.wait()
         get_session(token)
+        set_nexus_state(token, read_state_file(state_file))   # None -> session ended
 
         if mode == "pdf" and out_dir.exists() and any(out_dir.glob("*.pdf")):
             archive = shutil.make_archive(str(work / "nexus_pdfs"), "zip", out_dir)
@@ -355,7 +466,9 @@ def run_batch(po_list: list, user: str, pw: str, token: str, mode: str = "pdf") 
         watchdog.cancel()
         if proc.poll() is None:
             proc.kill()
-        shutil.rmtree(work, ignore_errors=True)   # all files deleted
+            proc.wait()
+        unregister_run(token, proc)
+        shutil.rmtree(work, ignore_errors=True)
 
     bar.empty()
     table_box.empty()
@@ -367,14 +480,16 @@ def run_batch(po_list: list, user: str, pw: str, token: str, mode: str = "pdf") 
              mode, user, len(po_list), counts, timed_out.is_set())
 
     return {"rows": rows, "final": final, "zip": zip_bytes, "timed_out": timed_out.is_set(),
-            "log": "\n".join(log_lines)}
+            "total": len(po_list), "log": "\n".join(log_lines)}
 
 
 def start_button(po_list: list, label: str, state_key: str, mode: str) -> None:
     """Checks the list, takes a browser slot, runs the worker, stores the result."""
     if not st.button(label, type="primary", key=f"{state_key}_start"):
         return
-    if not po_list:
+    if not nexus_session_alive(st.session_state["token"]):
+        st.error("Your Nexus session has ended. Please log out and sign in again.")
+    elif not po_list:
         st.error("Enter a PO number or upload an Excel file first.")
     elif len(po_list) > MAX_POS_PER_RUN:
         st.error(f"Too many POs: {len(po_list)}. Please split the list into runs of "
@@ -386,24 +501,39 @@ def start_button(po_list: list, label: str, state_key: str, mode: str) -> None:
                            "Please try again in a few minutes.")
             else:
                 st.session_state[state_key] = run_batch(
-                    po_list, user, pw, st.session_state["token"], mode)
+                    po_list, user, st.session_state["token"], mode)
 
 
 def batch_problem(batch: dict) -> bool:
-    """Shows the timeout / start / login messages. True if there are no results to show."""
+    """Shows the timeout / start / login / session messages.
+    True if there are no results to show."""
+    final, rows = batch["final"] or {}, batch["rows"]
     if batch["timed_out"]:
         st.warning(f"The run was stopped after {MAX_RUN_MINUTES} minutes. "
                    "Results finished so far are shown below. Run the rest again.")
-    if batch["final"] is None and not batch["rows"]:
+    if not batch["final"] and not rows:
         st.error("The run stopped before it started. Please try again.")
         return True
-    if batch["final"] and batch["final"].get("login_error"):
-        st.error("Login to Nexus failed. Please log out and sign in again.")
+    if final.get("login_error"):
+        if final.get("session_expired"):
+            st.error("Your Nexus session has ended. Please log out and sign in again.")
+        else:
+            st.error("Login to Nexus failed. Please log out and sign in again.")
         return True
+    if final.get("session_expired"):          # ended in the middle of the run
+        not_done = batch.get("total", len(rows)) - sum(
+            1 for r in rows if r.get("status") != "session_expired")
+        st.warning(f"Your Nexus session ended during the run. {not_done} PO(s) were not "
+                   "processed. Download the results below, then log out, sign in again "
+                   "and run those POs.")
     return False
 
 
-# PO PDF download page
+def error_count(counts: dict) -> int:
+    return sum(counts.get(k, 0) for k in ("error", "login_failed", "session_expired"))
+
+
+# page: PO PDF download
 def pdf_page() -> None:
     st.title("DPO PDF Downloader")
     po_list = po_inputs("pdf")
@@ -418,7 +548,7 @@ def pdf_page() -> None:
     st.success(
         f"Finished. Downloaded: {counts.get('downloaded', 0)} | "
         f"Not found: {counts.get('not_found', 0)} | "
-        f"Errors: {counts.get('error', 0) + counts.get('login_failed', 0)}"
+        f"Errors: {error_count(counts)}"
     )
     st.dataframe(df_res)
 
@@ -446,7 +576,7 @@ def summary_page() -> None:
     st.success(
         f"Finished. Done: {counts.get('done', 0)} | "
         f"Not found: {counts.get('not_found', 0)} | "
-        f"Errors: {counts.get('error', 0) + counts.get('login_failed', 0)}"
+        f"Errors: {error_count(counts)}"
     )
     st.dataframe(df_res)
 
@@ -471,7 +601,7 @@ else:
     cookie_token = st.context.cookies.get(COOKIE_NAME)
     sess = get_session(cookie_token)
     if sess:
-        st.session_state.update(user=sess["user"], pw=sess["pw"], token=cookie_token)
+        st.session_state.update(user=sess["user"], token=cookie_token)
 
 if st.session_state.pop("clear_cookie", False):
     set_cookie(COOKIE_NAME, "", delete=True)
@@ -488,19 +618,22 @@ if pending_cookie:
     set_cookie(COOKIE_NAME, pending_cookie)
 
 user = st.session_state["user"]
-pw = st.session_state["pw"]
 
 with st.sidebar:
     st.write(f"Signed in as **{user}**")
     page_choice = st.radio("Choose a tool", [PAGE_PDF, PAGE_SUMMARY], key="page")
     st.divider()
     if st.button("Log out"):
-        drop_session(st.session_state.get("token"))
+        drop_session(st.session_state.get("token"))   # removes the saved Nexus cookies
+        log.info("logout user=%s", user)
         st.session_state.clear()          # removes all
         st.session_state["clear_cookie"] = True
         st.rerun()
 
 # main page
+if not nexus_session_alive(st.session_state["token"]):
+    st.warning(SESSION_ENDED_MSG)
+
 if page_choice == PAGE_SUMMARY:
     summary_page()
 else:
