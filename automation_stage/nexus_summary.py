@@ -57,9 +57,10 @@ def _filter_visible(page: Page, timeout_ms: int) -> bool:
 
 
 def open_manifests_page(page: Page) -> None:
-    """Go to the manifests page. Logs in again once if the session expired."""
+    """Go to the manifests page. If the session ended: logs in again when a password
+    is available, otherwise login() raises SessionExpiredError."""
     page.goto(SUMMARY["manifests_url"], wait_until="domcontentloaded")
-    if _filter_visible(page, 8_000):
+    if _filter_visible(page, SUMMARY["timeout_ms"]):     # long wait
         return
 
     login(page, os.getenv("NEXUS_USERNAME", ""), os.getenv("NEXUS_PASSWORD", ""))
@@ -87,7 +88,7 @@ def _pick_link(links, po_id: str):
     for i in range(n):
         if links.nth(i).inner_text().strip() == po_id:
             return links.nth(i), n
-    po_alone = re.compile(rf"(?<!\d){re.escape(po_id)}(?!\d)")  
+    po_alone = re.compile(rf"(?<!\d){re.escape(po_id)}(?!\d)")   # not part of a longer number
     for i in range(n):
         row_text = links.nth(i).evaluate("a => (a.closest('tr') || a).innerText")
         if po_alone.search(row_text or ""):
