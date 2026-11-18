@@ -6,8 +6,9 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 import nexus_pdf
-from nexus_login import (CONFIG, LoginError, OrdersPageError,
-                         get_logged_in_context, is_logged_in, login)
+from nexus_login import (CONFIG, LoginError, OrdersPageError, SessionExpiredError,
+                         forget_session, get_logged_in_context, is_logged_in, login,
+                         save_session)
 from nexus_order import open_order
 from nexus_pdf import download_pdf
 from nexus_search import search_po
@@ -39,9 +40,11 @@ def check_login() -> dict:
 
 # download PDFs
 def go_home(page, home_url: str) -> None:
-    """Return to the orders page (with the PO filter box). Re-login if the session expired."""
+    """Return to the orders page (with the PO filter box).
+    If the session ended: logs in again when a password is available,
+    otherwise login() raises SessionExpiredError (nothing is sent to Nexus)."""
     page.goto(home_url, wait_until="domcontentloaded")
-    if not is_logged_in(page):
+    if not is_logged_in(page, CONFIG["timeout_ms"]):      # long wait: slow page != expired
         login(page, os.getenv("NEXUS_USERNAME", ""), os.getenv("NEXUS_PASSWORD", ""))
 
 
@@ -74,7 +77,7 @@ def run(po_ids: list, out_dir: str, headless: bool, skip_existing: bool,
         mode: str = "pdf") -> dict:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    nexus_pdf.PDF_DIR = out          # tell where to save
+    nexus_pdf.PDF_DIR = out          # tell nexus_pdf where to save
     process = process_summary if mode == "summary" else process_pdf
 
     results, total = [], len(po_ids)
@@ -83,9 +86,13 @@ def run(po_ids: list, out_dir: str, headless: bool, skip_existing: bool,
         try:
             browser, context, page = get_logged_in_context(p, headless=headless)
         except LoginError as e:
-            return {"login_error": str(e), "results": []}
+            forget_session()
+            return {"login_error": str(e),
+                    "session_expired": isinstance(e, SessionExpiredError), "results": []}
 
-        aborted = False
+        aborted = False          # stop the run
+        session_lost = False     # the Nexus session can not be used any more
+        expired = False          # ... because it ended (user must sign in again)
 
         try:
             for i, po in enumerate(po_ids, 1):
@@ -99,9 +106,13 @@ def run(po_ids: list, out_dir: str, headless: bool, skip_existing: bool,
                     for attempt in range(MAX_ATTEMPTS):
                         try:
                             res = process(page, po, out)
+                        except SessionExpiredError as e:
+                            res = {"po": po, "status": "session_expired", "note": str(e)}
+                            aborted = session_lost = expired = True
+                            break
                         except LoginError as e:
                             res = {"po": po, "status": "login_failed", "note": str(e)}
-                            aborted = True
+                            aborted = session_lost = True
                             break
                         except ManifestsPageError as e:      # no access: same for every PO
                             res = {"po": po, "status": "error", "note": str(e)}
@@ -119,9 +130,13 @@ def run(po_ids: list, out_dir: str, headless: bool, skip_existing: bool,
                 if aborted:
                     break
         finally:
+            if session_lost:
+                forget_session() 
+            else:
+                save_session(context)
             browser.close()
 
-    return {"login_error": None, "results": results}
+    return {"login_error": None, "session_expired": expired, "results": results}
 
 
 if __name__ == "__main__":
